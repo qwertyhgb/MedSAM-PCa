@@ -1,0 +1,50 @@
+# E0: Final Feature Linear Head —— 最弱但最干净的 decoder baseline
+# Phase 1 正式协议：fold0 = validation, fold1-4 = training
+run_name: e0_linear
+model_name: e0_linear
+checkpoint: weights/medsam_vit_b.pth
+encoder_frozen: true
+
+data:
+  dataset_root: /opt/data/private/lm/data/Prostate/PI-CAI
+  train_manifest: data/manifests/picai_slices_fold0_train.csv
+  val_manifest: data/manifests/picai_slices_fold0_val.csv
+  fold: 0
+  input_mode: t2_repeat          # T2 -> [T2, T2, T2]，不接 ADC/HBV
+  image_size: 1024
+  num_workers: 8
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+  mask_cache_dir: data/cache/masks_aligned
+  sampler:
+    positive_ratio: 0.5          # positive : negative = 1 : 1
+    num_samples: null            # null -> 2 * n_positive_slices
+
+loss:
+  name: dice_bce
+  dice_weight: 1.0
+  bce_weight: 1.0
+
+optimizer:
+  name: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+
+scheduler:
+  name: cosine
+  min_lr: 1.0e-6                 # eta_min
+
+train:
+  epochs: 40
+  batch_size: 4
+  gradient_accumulation: 1       # effective batch = batch_size * gradient_accumulation
+  amp: true
+  amp_dtype: float16
+  seed: 42
+  val_interval: 2                # 每 2 个 epoch 完整验证；epoch 1 额外验证一次
+  log_every: 20
+  max_iterations: null
+
+output:
+  root: outputs/runs
