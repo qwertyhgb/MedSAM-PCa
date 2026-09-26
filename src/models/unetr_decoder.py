@@ -1,24 +1,30 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""E2：UNETR-style 2D decoder（Phase 1 baseline）。
+"""E2：same-resolution multi-level transformer feature fusion decoder。
 
-思想：**深层 transformer 特征逐级上采样，较浅的 transformer 层作为 skip**。
+**架构命名修正（Phase 2A）**：本 decoder 在历史配置/checkpoint 中名为
+``e2_unetr``（为保持 checkpoint 兼容性不改名），但**它不是**严格意义上的
+spatial hierarchical UNETR：MedSAM ViT-B 的 ``f3`` / ``f6`` / ``f9`` /
+``f12`` 全部位于同一个 patch grid（64x64），因此 ``_up_to(x, ref)`` 的三次
+调用都发生在**相同空间尺寸**上——所谓"多级"是 **transformer 深度方向**的
+多级，而不是分辨率方向的多级金字塔。
 
-输入（全部为 ``[B, 768, 64, 64]``）：``f3`` / ``f6`` / ``f9`` / ``f12``，
-统一投影到 ``128`` 通道后，按下列路径重建：
+真实前向路径（输入 ``[B, 1, 1024, 1024]``，patch 16 → grid 64）：
 
-=================  ==============  ==========================
-阶段                空间尺寸         操作
-=================  ==============  ==========================
-p12                 64x64           1x1 投影 (deepest)
-fuse9              128x128         up x2 + concat p9 -> 3x3
-fuse6              256x256         up x2 + concat p6 -> 3x3
-fuse3              512x512         up x2 + concat p3 -> 3x3
-refine            1024x1024        up x2 -> 3x3
-=================  ==============  ==========================
+===================  ================  ==========================================
+阶段                  空间尺寸            操作
+===================  ================  ==========================================
+proj_deep            64x64             1x1 投影 ``f12``（最深）
+fuse_mid2            64x64             concat(prev, proj(f9)) -> Conv3x3 (同分辨率)
+fuse_mid1            64x64             concat(prev, proj(f6)) -> Conv3x3 (同分辨率)
+fuse_shallow         64x64             concat(prev, proj(f3)) -> Conv3x3 (同分辨率)
+refine              128x128           双线性 x2 -> Conv3x3
+head                128x128 -> 1024   ``TwoStageSegHead(upsample_factor=1)``
+===================  ================  ==========================================
 
-之后接与 E1/E3 **相同**的输出头（``TwoStageSegHead``，此处
-``upsample_factor=1``，因为特征已是 1024）。
+也就是说：**唯一的一次空间上采样发生在 fuse 之后**（64 -> 128），最终由输出头
+内部的双线性插值放大到 1024。历史文档曾错误地写成 ``64 -> 128 -> 256 -> 512
+-> 1024`` 的逐级上采样，那是与实现不符的描述。
 
 明确不含：attention gate、SE、CBAM、PPM、ASPP、deep supervision。
 """
@@ -33,6 +39,9 @@ import torch.nn.functional as F
 from .segmentation_head import TwoStageSegHead
 
 __all__ = ["UNETRStyleDecoder"]
+
+#: 融合结束后唯一的空间上采样倍率（64 -> 128），随后由输出头放大到 out_size。
+REFINE_UPSCALE = 2
 
 
 class _FuseBlock(nn.Module):
@@ -62,7 +71,12 @@ class _RefineBlock(nn.Module):
 
 
 class UNETRStyleDecoder(nn.Module):
-    """E2: 轻量 2D UNETR-style decoder（非 MONAI 3D UNETR 的复刻）。
+    """E2: same-resolution multi-level transformer feature fusion decoder。
+
+    四个 ViT 层（``f3`` / ``f6`` / ``f9`` / ``f12``）在 MedSAM ViT-B 中具有
+    **相同的空间分辨率**（64x64），因此本 decoder 的融合全部发生在 64x64，
+    只在融合结束后做一次 x2 上采样（64 -> 128），最后交给输出头放大到 1024。
+    详见模块 docstring 的架构命名修正说明。
 
     Args:
         in_channels: 每个 transformer 层的通道数（768）。
@@ -137,21 +151,26 @@ class UNETRStyleDecoder(nn.Module):
         return self.head(x)
 
     def intermediate_shapes(self, height: int = 64, width: int = 64) -> Dict[str, List[int]]:
-        """返回各级中间特征 shape（供测试与文档使用）。
+        """返回各级中间特征的**真实**空间尺寸（供测试与文档使用）。
+
+        Phase 2A 修正：四次融合全部发生在**相同分辨率**（等于输入 patch
+        grid 尺寸，MedSAM ViT-B 下为 64x64），只有 ``refine`` 位于 x2 之后。
+        旧版本曾错误地声明为 ``64 -> 128 -> 256 -> 512 -> 1024`` 的逐级上采样。
 
         Args:
-            height: 输入 patch grid 高。
-            width: 输入 patch grid 宽。
+            height: 输入 patch grid 高（ViT-B 为 64）。
+            width: 输入 patch grid 宽（ViT-B 为 64）。
 
         Returns:
-            阶段名 -> ``[C, H, W]``。
+            阶段名 -> ``[C, H, W]``；与真实 ``forward`` 的中间张量一致，
+            由 ``tests/test_decoder_shapes.py`` 通过 forward hook 校验。
         """
         c = self.decoder_channels
         return {
             "proj_deep": [c, height, width],
-            "fuse_mid2": [c, height * 2, width * 2],
-            "fuse_mid1": [c, height * 4, width * 4],
-            "fuse_shallow": [c, height * 8, width * 8],
-            "refine": [c, height * 16, width * 16],
+            "fuse_mid2": [c, height, width],
+            "fuse_mid1": [c, height, width],
+            "fuse_shallow": [c, height, width],
+            "refine": [c, height * REFINE_UPSCALE, width * REFINE_UPSCALE],
             "output": [1, self.out_size, self.out_size],
         }

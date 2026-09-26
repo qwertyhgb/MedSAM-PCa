@@ -1,4 +1,4 @@
-# E2：四级 ViT 特征 UNETR 式解码（UNETR-style Decoder）
+# E2：同分辨率多级 ViT 特征融合解码（same-resolution multi-level feature fusion）
 
 | 项目 | 值 |
 | --- | --- |
@@ -13,30 +13,37 @@
 
 ## 1. 实验目的
 
-E2 换掉了特征来源：不再使用 `neck`，而是取 ViT 主干的**四个中间 block 输出**（block 3/6/9/12 → `f3/f6/f9/f12`，各 768×64×64），按 UNETR 的方式从最深特征逐级上采样、与浅层特征拼接融合。
+E2 换掉了特征来源：不再使用 `neck`，而是取 ViT 主干的**四个中间 block 输出**（block 3/6/9/12 → `f3/f6/f9/f12`，各 768×64×64），从最深层开始逐级与较浅层特征做 concat + 3×3 卷积融合。
+
+> **架构命名说明（Phase 2A 修正）**：该 decoder 在配置与 checkpoint 中保留历史名称 `e2_unetr`（避免破坏已有 checkpoint 的可复现性），但**它不是严格意义上的 spatial hierarchical UNETR**。MedSAM ViT-B 的 `f3/f6/f9/f12` 位于**同一个 patch grid（64×64）**，因此三次融合全部是**同分辨率**融合，不存在逐级空间上采样。它是 `same-resolution multi-level transformer feature fusion decoder`（深度方向多级、分辨率方向单一）。
 
 它回答的问题：**ViT 中间层的多级跳连**（而非 neck 的单层特征）能否带来更好的边界与更少的假阳性？
 
 ## 2. 模型结构
 
 ```
-f3, f6, f9, f12  (各 [B, 768, 64, 64])
+f3, f6, f9, f12  (各 [B, 768, 64, 64]，分辨率相同)
   ├─ Conv1x1(768 → 128) ×4                     # 每级投影
-  └─ 自深向浅逐级融合（f12 → f9 → f6 → f3）:
-        up = F.interpolate(bilinear, size=下一级)
-        x  = Conv3x3(concat([up, f_i]) → 128) + GN + GELU     # _FuseBlock
-  └─ ×2 双线性上采样 → 1024×1024
-  └─ _RefineBlock: Conv3x3 + GN + GELU
+  └─ 从最深到最浅依次融合：
+        proj_deep    : f12 投影                       → 64×64
+        fuse_mid2    : concat(prev, proj(f9))  → 3×3   → 64×64   (同分辨率)
+        fuse_mid1    : concat(prev, proj(f6))  → 3×3   → 64×64   (同分辨率)
+        fuse_shallow : concat(prev, proj(f3))  → 3×3   → 64×64   (同分辨率)
+  └─ 双线性 ×2 → 128×128
+  └─ _RefineBlock: Conv3x3 + GN + GELU               → 128×128
   └─ TwoStageSegHead(upsample_factor=1):
        3x3 Conv(128→64) + GN + GELU → 3x3 Conv(64→32) + GN + GELU → 1x1 Conv(32→1)
-       → logits [B, 1, 1024, 1024]
+       → 内部双线性插值到 1024 → logits [B, 1, 1024, 1024]
 ```
+
+真实中间尺寸由 `intermediate_shapes()` 给出，并由 `tests/test_decoder_shapes.py` 通过 forward hook 校验：
+`proj_deep 64×64 → fuse_mid2 64×64 → fuse_mid1 64×64 → fuse_shallow 64×64 → refine 128×128 → output 1024×1024`。
 
 特点：
 
 - 四级特征全部来自 ViT 编码器，**没有自建金字塔**；
-- 融合只用 concat + 3×3 卷积，**无注意力、无 gating**（名字中的 UNETR 仅指"ViT 特征 + U 形逐级融合"这一范式）；
-- 所有 ViT 特征分辨率相同（64×64），所谓的"多级"是**深度方向**的多级，不是分辨率方向的多级——上采样只发生在最后 ×2 到 1024（`upsample_factor=1` 意味着输出头内部不做额外放大）。
+- 融合只用 concat + 3×3 卷积，**无注意力、无 gating**；
+- 因为四级特征分辨率相同（64×64），"多级"是**深度方向**的多级而非分辨率方向；**唯一一次空间上采样发生在融合之后**（64 → 128），最终由输出头放大到 1024。历史上曾被描述为 `64 → 128 → 256 → 512 → 1024` 的逐级上采样，那是与实现不符的错误描述（Phase 2A 已修正，见 `src/models/unetr_decoder.py` 模块 docstring）。
 
 checkpoint 保存 28 个张量，文件 18.3 MB。
 

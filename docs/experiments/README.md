@@ -11,7 +11,8 @@
 | [e1_simple_pyramid.md](e1_simple_pyramid.md) | E1：neck 单尺度金字塔 + FPN（1,061,601 可训练参数） |
 | [e2_unetr.md](e2_unetr.md) | E2：四级 ViT 特征 UNETR 式解码（1,519,329 可训练参数） |
 | [e3_multilevel_fpn.md](e3_multilevel_fpn.md) | E3：多层级金字塔 + FPN（1,209,185 可训练参数） |
-| [tables/](tables/) | 四组实验逐 epoch 完整指标表（由 `metrics.csv` 生成） |
+| [phase2a_evaluation.md](phase2a_evaluation.md) | Phase 2A：指标接口审计与修复、多阈值扫描、volume / lesion 级评估 |
+| [tables/](tables/) | 逐 epoch 指标表 + Phase 2A 汇总表（均由脚本生成） |
 
 ---
 
@@ -29,7 +30,7 @@ Phase 1 的核心问题：
 | --- | --- | --- | --- | --- |
 | decoder | `LinearHead`（1×1 conv + 双线性上采样） | `SimplePyramid` + FPN | `UNETRStyleDecoder` | `MultiLevelFPN` |
 | 读取的编码器特征 | `neck`（256ch，单层） | `neck`（256ch，单层） | `f3/f6/f9/f12`（768ch，四级） | `f3/f6/f9/neck`（四级，含 neck） |
-| 跳连层级 | 无 | 无（单尺度自建金字塔 P2–P5） | 四级 ViT 特征 | 四级混合特征 |
+| 多级特征来源 | 无 | 无（单尺度自建金字塔 P2–P5） | 四级 ViT **深度**特征（分辨率相同，64×64） | 四级混合特征（含 neck，分辨率相同） |
 | 上采样方式 | 双线性到 1024 | 转置卷积 + nearest 融合 | 双线性 + concat + 3×3 conv | 转置卷积 + nearest FPN 融合 |
 | 可训练参数 | **257** | **1,061,601** | **1,519,329** | **1,209,185** |
 | 输出分辨率 | 1024×1024 | 1024×1024 | 1024×1024 | 1024×1024 |
@@ -116,12 +117,23 @@ E1/E3 单 epoch 训练时间比 E0/E2 长约 25%，与其在 1024² 分辨率上
 
 四组实验在训练过程中均出现"梯度非有限，跳过该步"的告警：E0 14 次、E1 15 次、E2 13 次、E3 14 次（fp16 AMP + GradScaler 已启用）。单步跳过未影响训练连续性，但说明 fp16 下存在数值风险，建议改用 bf16 或对损失/梯度做更严格的处理。
 
-### 4.8 尚未完成的部分
+### 4.8 本文件之外的评估（Phase 2A 已补齐）
 
-- `evaluate.py` **尚未执行**：目前所有报告数字均为训练期切片级指标，没有 volume 级预测、没有 per-case 指标、没有阈值扫描。
-- 未做任何后处理（最大连通域、最小体积过滤、切片间一致性）。
-- 未使用 ADC/HBV 序列（`input_mode: t2_repeat`，T2W 复制三通道）。
-- 输入归一化使用非零区域 0.5/99.5 百分位映射到 [0,1]，**未采用 MedSAM/SAM 官方 `pixel_mean`/`pixel_std` 归一化**，与预训练分布存在域偏移风险（尚未做消融验证）。
+本文件其他章节的数字**全部来自训练期的切片级验证**（1024 网格、`val_interval=2` 的 21 个验证点）。
+Phase 2A 在同一批 checkpoint 上补齐了独立评估：显式类型的指标 API、19 个阈值的扫描、
+原始分辨率的 3D Dice、26-连通域的 lesion 级指标、小病灶分层与连通域过滤分析，详见
+[phase2a_evaluation.md](phase2a_evaluation.md)。其中三条与本文件结论直接相关：
+
+- **阈值校准收益很小**：三个 best checkpoint 在最优阈值下的阳性切片 Dice 增益分别只有
+  +0.0008 / +0.0075 / +0.0003；
+- **volume 级 3D Dice 只有 0.27–0.30**（阳性 case），明显低于切片级 0.44–0.48——
+  "切片 Dice 0.48"不能解读为三维分割质量；
+- **病灶检出率 89%–95%，但每 case 平均 6.7–21.3 个假阳性连通域**，且三个 checkpoint 在
+  216 个阴性 case 上的假阳性 case 率都是 1.00。
+
+仍未完成：后处理（切片间一致性、形态学操作、连通域过滤入流程）尚未纳入正式流水线；
+未使用 ADC/HBV 序列（`input_mode: t2_repeat`，T2W 复制三通道）。
+- 输入归一化把强度映射到 **[0,1] 区间**，这与官方 MedSAM 训练/推理示例一致（官方 `train_one_gpu.py` 要求 *image normalized to [0,1]* 后直接送入 `image_encoder`，`MedSAM_Inference.py` 同样使用 min-max 归一化到 [0,1] 后直接前向）。本项目的差别只在于**先做非零区域 0.5/99.5 百分位裁剪、再做 min-max**，官方示例主要是纯 min-max。**不需要切换到 SAM/ImageNet 的 `pixel_mean`/`pixel_std`**；若做归一化消融，应比较 plain min-max 与 percentile clipping + min-max（见 `protocol.md` 第 4 节）。
 
 ## 5. 结论与下一步
 
@@ -133,14 +145,16 @@ Phase 1 的结论是：
 
 下一步优先级建议（按预期收益排序）：
 
-| 优先级 | 动作 | 依据 |
+| 优先级 | 动作 | 状态 / 依据 |
 | --- | --- | --- |
-| P0 | 运行 `evaluate.py` 做 volume 级 + per-case 评估，并做阈值扫描 | 现有数字全部是训练期切片指标，无法判断真实病灶检出水平 |
-| P0 | 加入后处理（最小体积过滤 + 最大连通域） | precision 0.06–0.15，预测面积远超病灶 |
-| P0 | 定位真实峰值：`val_interval=1` 重跑 E3，或从 `checkpoint_latest` 的 epoch 4–12 做回放评估 | best 出现在 epoch 6，峰值可能被 2-epoch 间隔掩盖 |
-| P1 | 损失改造：BCE 加 `pos_weight`，或换 Tversky/Focal，并启用 `DiceBCELoss.components()` 分项日志 | 正像素占比 0.009% |
-| P1 | 归一化消融：官方 `pixel_mean/std` vs 现有百分位归一化 | 与 MedSAM 预训练域对齐 |
-| P1 | 早停 / 缩短训练至 15–20 epoch，或加强正则（增强仅翻转+旋转±15°+缩放） | 最佳 epoch 6–8，之后 40 轮全部浪费 |
+| ✅ 已完成 | volume 级 + lesion 级评估与 19 阈值扫描（Phase 2A） | 见 [phase2a_evaluation.md](phase2a_evaluation.md)：阈值增益 ≤ +0.0075；volume 3D Dice 0.27–0.30；FP 连通域 6.7–21.3 /case |
+| P0 | 按下游用途重定义 checkpoint 选择准则（联合 pos-Dice 与 FP lesions/case，或直接在 lesion 级指标上选） | 现行 `max(pos-Dice)` 准则选出的是 FP/case 21.3 的解 |
+| P0 | 把 10–25 mm³ 连通域过滤纳入评估与下游流程 | E2 best 在 10 mm³ 过滤下仅损失 0.011 灵敏度、减少约 0.9 FP/case |
+| P0 | 定位真实峰值：`val_interval=1` 重跑 E3，或对 epoch 4–12 的 `checkpoint_latest` 做回放评估 | best 出现在 epoch 6–8，峰值可能被 2-epoch 间隔掩盖 |
+| P1 | 损失改造：BCE 加 `pos_weight`，或换 Tversky/Focal，并启用 `DiceBCELoss.components()` 分项日志 | 正像素占比 0.009%；阈值与过滤都已触及上限 |
+| P1 | 归一化消融：plain min-max vs 现有 percentile clipping + min-max | 两者都落在官方 [0,1] 口径内，比较裁剪对对比度的影响 |
+| P1 | 早停 / 缩短训练至 15–20 epoch，或加强正则（增强仅翻转+旋转±15°+缩放） | 最佳 epoch 6–8，之后 30+ 轮全部在主指标上退化 |
+| P1 | 用同一套三维口径重跑其它 fold，确认 E2/E3 排序是否稳定 | 目前全部结论来自单一 fold0、单一 seed |
 | P2 | 验证集子采样（如按 case 抽 1/3）或加大 `val_interval` | 验证占掉近一半机时 |
 | P2 | 数值稳定性：AMP 改 bf16 | 每实验 13–15 次非有限梯度 |
 | P2 | 解冻部分编码器（如最后 1–2 个 block 或 LoRA/adapter）作为对照 | 验证"冻结是否本身成为上限" |

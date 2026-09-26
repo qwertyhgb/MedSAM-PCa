@@ -375,8 +375,8 @@ def validate(model, loader, criterion, cfg, epoch: int, total_epochs: int,
             loss = criterion(out["logits"], masks)
         total_loss += float(loss.item())
         n += 1
-        metrics.update(out["logits"].float(), masks,
-                       case_ids=list(batch["case_id"]) if collect_per_case else None)
+        metrics.update_logits(out["logits"].float(), masks,
+                              case_ids=list(batch["case_id"]) if collect_per_case else None)
         bar.set_postfix({"loss": f"{total_loss / max(n, 1):.4f}",
                          "gpu": f"{gpu_mem_gib():.1f}G"})
     bar.close()

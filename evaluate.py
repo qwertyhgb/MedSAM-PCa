@@ -110,7 +110,7 @@ def evaluate(cfg: Dict[str, Any], checkpoint: Path, out_dir: Path,
         with torch.amp.autocast("cuda", dtype=torch.float16,
                                 enabled=torch.cuda.is_available()):
             logits = model(images)["logits"].float()
-        metrics.update(logits, masks, case_ids=list(batch["case_id"]))
+        metrics.update_logits(logits, masks, case_ids=list(batch["case_id"]))
 
         if save_predictions:
             pred = (torch.sigmoid(logits) > threshold).float()  # [B,1,1024,1024]

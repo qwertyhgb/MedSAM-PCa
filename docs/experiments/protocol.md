@@ -61,7 +61,9 @@ T2W 体数据按轴位逐层展开为 2D 样本，mask 与 T2W 几何对齐后�
 2. `clip_normalize`：对**非零区域**做 0.5 / 99.5 百分位裁剪后线性映射到 [0,1]（非零区为空时退化为全图百分位；动态范围退化或出现非有限值时返回全零）；
 3. resize 到 1024×1024：图像双线性、mask 最近邻（并断言 mask 取值仍为 {0,1}）。
 
-> 与 MedSAM 预训练不一致之处：SAM/MedSAM 官方预处理使用 `pixel_mean = [123.675, 116.28, 103.53]`、`pixel_std = [58.395, 57.12, 57.375]` 的归一化，而本流程输出 [0,1] 区间。本阶段未做该消融。
+> **归一化口径说明（Phase 2A 修正）**：本流程输出 **[0,1]** 区间，这与官方 MedSAM 的训练/推理口径**一致**——官方 `train_one_gpu.py` 明确要求把图像归一化到 [0,1] 后直接送入 `image_encoder`，`MedSAM_Inference.py` 同样以 min-max 归一化到 [0,1] 后直接前向。本项目的唯一区别是**先对非零区域做 0.5/99.5 百分位裁剪，再做 min-max**；官方示例以纯 min-max 为主。
+>
+> 因此**不应**把输入切换成 SAM/ImageNet 的 `pixel_mean = [123.675, 116.28, 103.53]` / `pixel_std = [58.395, 57.12, 57.375]`。若未来做归一化消融，应比较：(a) plain min-max；(b) percentile clipping + min-max。
 
 **数据增强（仅训练集）**
 
@@ -106,10 +108,56 @@ T2W 体数据按轴位逐层展开为 2D 样本，mask 与 T2W 几何对齐后�
 | precision / recall / specificity | `TP/(TP+FP)`、`TP/(TP+FN)`、`TN/(TN+FP)` | **像素级全局微平均**（先累加 TP/FP/FN/TN） |
 | `fp_slice_rate` | 阴性切片中被预测出至少 1 个阳性像素的比例 | `FP 切片数 / GT 空切片数` |
 
-- 阈值固定 **0.5**（对 logits 先 sigmoid 再 `>= 0.5`），**无阈值扫描或概率校准**。
+- 阈值默认 **0.5**；Phase 2A 增加了多阈值扫描（见 6.1、6.2 节）。
 - `eps = 1e-8`。
 - 空 mask 规则：空 GT + 空预测 → Dice 1.0；空 GT + 非空预测 → 计入 FP 切片。
-- **尚未实现**：lesion-wise 指标、per-case 聚合指标（`per_case_summary` 已实现但本阶段未使用）、volume 级评估。
+- Phase 1 未实现的部分已在 **Phase 2A** 补齐：volume 级 3D Dice/IoU、lesion-wise 指标
+  （3D 26-连通域）、per-case 汇总、FP lesions/case、小病灶体积分层、评估期连通域体积过滤。
+
+### 6.1 指标输入类型必须显式声明（Phase 2A 修正）
+
+旧实现用 `arr.min() < 0 or arr.max() > 1` 猜测输入是 logits 还是概率：当 logits 恰好都落在
+`[0, 1]` 时会被误判为概率，静默产生错误指标。现在改为**显式 API**：
+
+| 入口 | 语义 |
+| --- | --- |
+| `metrics.update_logits(x, gt, case_ids)` | 内部 `sigmoid(x) >= threshold` |
+| `metrics.update_probabilities(p, gt, case_ids)` | 内部 `p >= threshold`；越界（如误传 logits）直接报错 |
+| `metrics.update_binary(b, gt, case_ids)` | `b` 必须是 bool 或 `{0,1}`，否则报错 |
+| `metrics.update(x, gt, kind=...)` | 兼容入口，**不传 `kind` 直接 `TypeError`** |
+
+`train.py` 的验证循环与 `evaluate.py` 均改用 `update_logits`；新增测试
+`tests/test_metrics_api.py` 锁定行为（含 `logits=0.2 → 0.5498 → positive`、
+`logits=-0.2 → negative`、`probability=0.2 → negative` 等用例）。
+
+### 6.2 Phase 2A 评估流程与产物
+
+**只做前向推理，不训练、不改动 checkpoint。** 两步流程：
+
+```bash
+# 步骤 1：8 个 checkpoint 的多阈值切片级扫描（一次 forward 同时累计 19 个阈值）
+#         其中 E2/E3 的 4 个 checkpoint 额外缓存原始分辨率概率体积（供步骤 2 复用）
+python scripts/evaluate_thresholds.py \
+    --cache-probs --cache-runs e2_unetr e3_multilevel_fpn \
+    --out-dir outputs/evaluation/threshold_scan \
+    --cache-root outputs/evaluation/prob_cache
+
+# 步骤 2：读取概率缓存做 volume / lesion 级评估（不重复 forward）
+python scripts/evaluate_volumes.py \
+    --cache-root outputs/evaluation/prob_cache \
+    --out-dir outputs/evaluation/volume \
+    --thresholds 0.05 ... 0.95 --primary-thresholds 0.5 \
+    --min-volumes-mm3 0 10 25 50 100 250
+```
+
+多阈值累计使用**概率直方图法**（`src/metrics/threshold_scan.py`，2000 bins，bin 宽 5e-4）：
+阈值网格是 bin 宽的整数倍时，`p >= t` 与「bin 下标 `>= k`」严格等价，因此与逐阈值布尔
+实现的结果**完全一致**（由 `tests/test_threshold_scan.py` 断言）。
+
+**分辨率与插入方式**：概率图在 1024×1024 上产生，以 **bilinear** 下采样回 T2W 原始分辨率，
+**二值化在原始分辨率上执行**（二值 mask 全程不做插值）；GT 直接取自与 T2W 几何对齐的
+原始标注。因此切片级指标（1024 网格）与 volume/lesion 级指标（原始网格）口径略有差异，
+报告中必须分别标注。
 
 ## 7. 硬件与环境
 

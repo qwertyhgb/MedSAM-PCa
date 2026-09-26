@@ -43,6 +43,7 @@ __all__ = [
     "PICAI2DDataset",
     "BalancedSliceSampler",
     "read_geometry",
+    "read_mask_volume",
     "geometries_match",
     "scan_case_slices",
     "clip_normalize",
@@ -219,6 +220,43 @@ def read_mask_slice(mask_path: str, t2w_path: str, z: int,
             f"重采样后 mask 层数 {arr.shape[0]} 与请求 slice {z} 不匹配于 {mask_path}"
         )
     return arr[z]
+
+
+def read_mask_volume(mask_path: str, t2w_path: str,
+                     cache_dir: Optional[Path] = None) -> np.ndarray:
+    """读取与 T2W 几何一致的**整卷** mask（供 volume / lesion 级评估使用）。
+
+    几何一致时直接读整卷；不一致时以 **T2W 为 reference** 做 nearest-neighbor
+    对齐（优先复用磁盘缓存，绝不修改原始标注）。
+
+    Args:
+        mask_path: lesion mask 路径。
+        t2w_path: T2W 路径（reference）。
+        cache_dir: 对齐缓存目录；``None`` 时每次现场重采样。
+
+    Returns:
+        ``[Z, H, W]`` 数组（保留原始标签值，调用方自行按 ``> 0`` 二值化）。
+
+    Raises:
+        ValueError: 对齐后层数与 T2W 不一致。
+    """
+    t2w_geom = read_geometry(t2w_path)
+    mask_geom = read_geometry(mask_path)
+    if geometries_match(mask_geom, t2w_geom):
+        return sitk.GetArrayFromImage(sitk.ReadImage(mask_path))
+
+    if cache_dir is not None:
+        aligned_path = _ensure_aligned_mask(mask_path, t2w_path, Path(cache_dir))
+        arr = sitk.GetArrayFromImage(sitk.ReadImage(aligned_path))
+    else:
+        arr = sitk.GetArrayFromImage(_resample_mask_to_reference(mask_path, t2w_path))
+
+    if arr.shape[0] != t2w_geom["size"][2]:
+        raise ValueError(
+            f"对齐后 mask 层数 {arr.shape[0]} 与 T2W {t2w_geom['size'][2]} 不一致"
+            f"（mask={mask_path}）"
+        )
+    return arr
 
 
 def scan_case_slices(case_id: str, patient_id: str, t2w_path: str,
