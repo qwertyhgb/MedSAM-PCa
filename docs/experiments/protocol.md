@@ -154,6 +154,11 @@ python scripts/evaluate_volumes.py \
 阈值网格是 bin 宽的整数倍时，`p >= t` 与「bin 下标 `>= k`」严格等价，因此与逐阈值布尔
 实现的结果**完全一致**（由 `tests/test_threshold_scan.py` 断言）。
 
+> **关于 `prob_cache/`**：它是可重建的中间产物（每个 checkpoint 约 4.5 GB，4 个 checkpoint
+> 合计约 18 GB），不长期保留在工作区。需要重新做 volume / lesion 分析时，按步骤 1 的命令
+> 重新生成即可（约 8 分钟/checkpoint，需要 GPU）；已有的分析结果不会因此丢失
+> （`threshold_scan/` 与 `volume/` 下的 CSV / JSON 仍在）。
+
 **分辨率与插入方式**：概率图在 1024×1024 上产生，以 **bilinear** 下采样回 T2W 原始分辨率，
 **二值化在原始分辨率上执行**（二值 mask 全程不做插值）；GT 直接取自与 T2W 几何对齐的
 原始标注。因此切片级指标（1024 网格）与 volume/lesion 级指标（原始网格）口径略有差异，
